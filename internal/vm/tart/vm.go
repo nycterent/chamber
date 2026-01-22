@@ -23,6 +23,7 @@ type DirectoryMount struct {
 	Path     string
 	Tag      string
 	ReadOnly bool
+	VMPath   string // Optional: if set, executor will create symlink from VMPath to ~/workspace/<Name>
 }
 
 const (
@@ -181,4 +182,26 @@ func CloneVM(ctx context.Context, from, to string) error {
 		return fmt.Errorf("failed to clone VM from %q to %q: %w", from, to, err)
 	}
 	return nil
+}
+
+// VMExists checks if a VM with the given name exists
+func VMExists(name string) bool {
+	ctx := context.Background()
+	stdout, _, err := CmdWithCapture(ctx, nil, "list")
+	if err != nil {
+		return false
+	}
+
+	// Parse the output to find the VM name
+	lines := strings.Split(stdout, "\n")
+	for _, line := range lines {
+		// Each line contains a VM name (potentially with spaces)
+		// The VM name is the first field
+		fields := strings.Fields(line)
+		if len(fields) > 0 && fields[0] == name {
+			return true
+		}
+	}
+
+	return false
 }

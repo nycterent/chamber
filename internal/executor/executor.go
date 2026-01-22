@@ -6,17 +6,27 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"strings"
 
 	"github.com/cirruslabs/chamber/internal/ssh"
 	gossh "golang.org/x/crypto/ssh"
 )
 
+// SymlinkMount represents a directory mount that needs a symlink
+type SymlinkMount struct {
+	MountName string
+	VMPath    string
+	CopyMode  bool   // If true, copy contents instead of symlinking (for read-only mounts)
+	HostPath  string // Original host path, used to create user compatibility symlinks
+}
+
 type Executor struct {
 	sshClient      *gossh.Client
 	workingDir     string
 	mountedWorkDir string
 	dirName        string
+	symlinks       []struct{ from, to string } // Track symlinks for cleanup
 }
 
 func New(sshClient *gossh.Client, workingDir string, dirName string) *Executor {
@@ -65,6 +75,187 @@ func (e *Executor) UnmountWorkingDirectory(ctx context.Context) error {
 	_ = session.Run(command)
 
 	return nil
+}
+
+// CreateSymlinks creates symlinks for directory mounts with custom VM paths.
+// mountName is the name used in ~/workspace/<mountName>
+// vmPath is the desired location in the VM (e.g., ~/.claude)
+func (e *Executor) CreateSymlinks(ctx context.Context, mounts []SymlinkMount) error {
+	if len(mounts) == 0 {
+		return nil
+	}
+
+	session, err := e.sshClient.NewSession()
+	if err != nil {
+		return fmt.Errorf("failed to create SSH session: %w", err)
+	}
+	defer session.Close()
+
+	// Capture stderr for debugging
+	var stderr strings.Builder
+	session.Stderr = &stderr
+
+	var commands []string
+
+	// Track host user directories that need compatibility symlinks
+	// e.g., if host path is /Users/saint/.claude, we need /Users/saint -> /Users/admin
+	hostUserDirs := make(map[string]bool)
+	macUserPattern := regexp.MustCompile(`^/Users/([^/]+)`)
+
+	for _, m := range mounts {
+		sourcePath := fmt.Sprintf("$HOME/workspace/%s", m.MountName)
+		targetPath := m.VMPath
+
+		// Expand ~ to $HOME for consistency
+		if targetPath == "~" {
+			targetPath = "$HOME"
+		} else if strings.HasPrefix(targetPath, "~/") {
+			targetPath = "$HOME/" + targetPath[2:]
+		}
+
+		// Create parent directory if needed, remove existing file/link
+		commands = append(commands,
+			fmt.Sprintf("mkdir -p $(dirname %s)", targetPath),
+			fmt.Sprintf("rm -rf %s", targetPath),
+		)
+
+		if m.CopyMode {
+			// Copy the entire directory (for read-only mounts that need to be writable in VM)
+			// Use rsync with flags to avoid extended attribute issues with symlinks
+			// -r = recursive
+			// -l = preserve symlinks
+			// -t = preserve timestamps
+			// -D = preserve devices and special files
+			// (equivalent to -a but without -p/-o/-g which try to preserve permissions/ownership)
+			commands = append(commands,
+				fmt.Sprintf("rsync -rltD %s/ %s/", sourcePath, targetPath),
+			)
+
+			// Track host user directory for compatibility symlink
+			if m.HostPath != "" {
+				if matches := macUserPattern.FindStringSubmatch(m.HostPath); len(matches) > 1 {
+					hostUserDirs[matches[1]] = true
+				}
+			}
+		} else {
+			// Create symlink (default behavior)
+			commands = append(commands,
+				fmt.Sprintf("ln -s %s %s", sourcePath, targetPath),
+			)
+		}
+
+		e.symlinks = append(e.symlinks, struct{ from, to string }{from: targetPath, to: sourcePath})
+	}
+
+	// Create compatibility symlinks for host user directories
+	// This ensures paths like /Users/saint/.claude/plugins/cache/... work in the VM
+	// by creating /Users/saint -> /Users/<vm-user>
+	for hostUser := range hostUserDirs {
+		// Create symlink: /Users/<host-user> -> /Users/<vm-user>
+		// We use $USER to get the VM's current username dynamically
+		commands = append(commands,
+			fmt.Sprintf(`if [ ! -d "/Users/%s" ] && [ "$USER" != "%s" ]; then sudo mkdir -p /Users && sudo ln -sf "/Users/$USER" "/Users/%s"; fi`,
+				hostUser, hostUser, hostUser),
+		)
+		e.symlinks = append(e.symlinks, struct{ from, to string }{from: fmt.Sprintf("/Users/%s", hostUser), to: "/Users/$USER"})
+	}
+
+	command := strings.Join(commands, " && ")
+	if err := session.Run(command); err != nil {
+		errMsg := stderr.String()
+		if errMsg != "" {
+			return fmt.Errorf("failed to create symlinks: %w (stderr: %s)", err, errMsg)
+		}
+		return fmt.Errorf("failed to create symlinks: %w", err)
+	}
+
+	return nil
+}
+
+// CleanupSymlinks removes symlinks created by CreateSymlinks
+func (e *Executor) CleanupSymlinks(ctx context.Context) error {
+	if len(e.symlinks) == 0 {
+		return nil
+	}
+
+	session, err := e.sshClient.NewSession()
+	if err != nil {
+		return fmt.Errorf("failed to create SSH session: %w", err)
+	}
+	defer session.Close()
+
+	var commands []string
+	for _, link := range e.symlinks {
+		commands = append(commands, fmt.Sprintf("rm -f %s", link.from))
+	}
+
+	command := strings.Join(commands, " ; ") // Use ; to continue even if some fail
+
+	// Ignore errors on cleanup
+	_ = session.Run(command)
+
+	return nil
+}
+
+// UpdateClaude updates Claude CLI to the latest version in the VM
+func (e *Executor) UpdateClaude(ctx context.Context) error {
+	session, err := e.sshClient.NewSession()
+	if err != nil {
+		return fmt.Errorf("failed to create SSH session: %w", err)
+	}
+	defer session.Close()
+
+	// Run npm install -g to update Claude CLI
+	// Use login shell (-l) to load user's PATH where npm is configured
+	// Redirect output to /dev/null to keep it quiet, but preserve exit code
+	command := "zsh -l -c 'npm install -g @anthropic-ai/claude-code@latest >/dev/null 2>&1'"
+
+	if err := session.Run(command); err != nil {
+		// Don't fail hard on update errors - just log a warning
+		// This ensures Chamber still works even if npm has issues
+		return fmt.Errorf("warning: failed to update Claude CLI (continuing anyway): %w", err)
+	}
+
+	return nil
+}
+
+// ConfigureSharedHostname sets up a hostname that resolves to the host machine from within the VM.
+// This allows plugins to use the same hostname whether running on the host or in the VM.
+func (e *Executor) ConfigureSharedHostname(ctx context.Context, hostname string) (string, error) {
+	session, err := e.sshClient.NewSession()
+	if err != nil {
+		return "", fmt.Errorf("failed to create SSH session: %w", err)
+	}
+	defer session.Close()
+
+	// Get the default gateway IP, which is the host machine in Tart VMs
+	var stdout strings.Builder
+	session.Stdout = &stdout
+
+	// Use netstat to find the default gateway (the host machine)
+	command := "netstat -nr | grep default | grep -v 'link#' | awk '{ print $2 }' | head -1"
+	if err := session.Run(command); err != nil {
+		return "", fmt.Errorf("failed to get default gateway: %w", err)
+	}
+
+	hostIP := strings.TrimSpace(stdout.String())
+	if hostIP == "" {
+		return "", fmt.Errorf("could not determine host IP (no default gateway found)")
+	}
+
+	// Add hostname entry to /etc/hosts pointing to the host IP
+	session2, err := e.sshClient.NewSession()
+	if err != nil {
+		return "", fmt.Errorf("failed to create SSH session: %w", err)
+	}
+	defer session2.Close()
+
+	addHostCommand := fmt.Sprintf("echo '%s %s' | sudo tee -a /etc/hosts >/dev/null", hostIP, hostname)
+	if err := session2.Run(addHostCommand); err != nil {
+		return "", fmt.Errorf("failed to add hostname to /etc/hosts: %w", err)
+	}
+
+	return hostIP, nil
 }
 
 func (e *Executor) Execute(ctx context.Context, command string, args []string) error {

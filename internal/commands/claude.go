@@ -16,25 +16,43 @@ import (
 )
 
 // parseDirectoryMounts parses --dir flag values into DirectoryMount structs.
-// Format: name:path[:ro]
+// Format: name:hostpath[:ro] OR vmpath:hostpath[:ro]
 // Examples:
-//   - data:~/my-data
-//   - docs:/path/to/docs:ro
+//   - data:~/my-data              # mounts to ~/workspace/data
+//   - docs:/path/to/docs:ro       # mounts to ~/workspace/docs (read-only)
+//   - ~/.claude:~/.claude:ro      # mounts to ~/.claude in VM (read-only)
+//   - ~/.config:~/.config         # mounts to ~/.config in VM
 //
 // Note: ~username syntax is not supported, only ~ for current user's home directory.
+// If first part starts with / or ~, it's treated as a VM path and a symlink is created.
 func parseDirectoryMounts(dirs []string) ([]tart.DirectoryMount, error) {
 	var mounts []tart.DirectoryMount
 	seenNames := make(map[string]bool)
+	mountIndex := 0
 
 	for _, dir := range dirs {
 		parts := strings.Split(dir, ":")
 		if len(parts) < 2 {
-			return nil, fmt.Errorf("invalid --dir format: %q (expected name:path[:ro])", dir)
+			return nil, fmt.Errorf("invalid --dir format: %q (expected name:hostpath[:ro] or vmpath:hostpath[:ro])", dir)
 		}
 
-		name := strings.TrimSpace(parts[0])
-		if name == "" {
+		firstPart := strings.TrimSpace(parts[0])
+		if firstPart == "" {
 			return nil, fmt.Errorf("invalid --dir format: %q (mount name cannot be empty)", dir)
+		}
+
+		var name, vmPath string
+		hostPath := parts[1]
+
+		// Check if first part is a VM path (starts with / or ~)
+		if strings.HasPrefix(firstPart, "/") || strings.HasPrefix(firstPart, "~") {
+			// This is a VM path - generate a unique mount name
+			vmPath = firstPart
+			name = fmt.Sprintf("mount-%d", mountIndex)
+			mountIndex++
+		} else {
+			// This is a mount name
+			name = firstPart
 		}
 
 		// Check for duplicate mount names
@@ -43,26 +61,24 @@ func parseDirectoryMounts(dirs []string) ([]tart.DirectoryMount, error) {
 		}
 		seenNames[name] = true
 
-		path := parts[1]
-
-		// Expand ~ or ~/... to the current user's home directory.
+		// Expand ~ or ~/... in host path to the current user's home directory.
 		// Note: forms like ~username/... are not supported.
-		if path == "~" || strings.HasPrefix(path, "~/") {
+		if hostPath == "~" || strings.HasPrefix(hostPath, "~/") {
 			home, err := os.UserHomeDir()
 			if err != nil {
 				return nil, fmt.Errorf("failed to get home directory: %w", err)
 			}
-			if path == "~" {
-				path = home
+			if hostPath == "~" {
+				hostPath = home
 			} else {
-				path = filepath.Join(home, path[2:])
+				hostPath = filepath.Join(home, hostPath[2:])
 			}
 		}
 
 		// Convert to absolute path
-		absPath, err := filepath.Abs(path)
+		absPath, err := filepath.Abs(hostPath)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get absolute path for %q: %w", path, err)
+			return nil, fmt.Errorf("failed to get absolute path for %q: %w", hostPath, err)
 		}
 
 		// Check if read-only (only "ro" is valid)
@@ -79,6 +95,7 @@ func parseDirectoryMounts(dirs []string) ([]tart.DirectoryMount, error) {
 			Name:     name,
 			Path:     absPath,
 			ReadOnly: readOnly,
+			VMPath:   vmPath,
 		})
 	}
 	return mounts, nil
@@ -103,7 +120,7 @@ Example:
 			// Prepend claude command and --dangerously-skip-permissions flag
 			claudeArgs := []string{"claude", "--dangerously-skip-permissions"}
 			claudeArgs = append(claudeArgs, args...)
-			return runCommand(cmd.Context(), vmImage, 0, 0, "admin", "admin", additionalDirs, true, claudeArgs)
+			return runCommand(cmd.Context(), vmImage, 0, 0, "admin", "admin", additionalDirs, sharedHostname, true, claudeArgs)
 		},
 	}
 
@@ -117,7 +134,7 @@ Example:
 	return cmd
 }
 
-func runCommand(ctx context.Context, vmImage string, cpuCount, memoryMB uint32, sshUser, sshPass string, extraDirs []string, interactive bool, args []string) error {
+func runCommand(ctx context.Context, vmImage string, cpuCount, memoryMB uint32, sshUser, sshPass string, extraDirs []string, sharedHostname string, interactive bool, args []string) error {
 	// Check if Tart is installed
 	if !tart.Installed() {
 		return fmt.Errorf("tart is not installed. Please install it from https://github.com/cirruslabs/tart")
@@ -236,6 +253,54 @@ func runCommand(ctx context.Context, vmImage string, cpuCount, memoryMB uint32, 
 	defer func() {
 		_ = exec.UnmountWorkingDirectory(ctx)
 	}()
+
+	// Create symlinks for mounts with custom VM paths
+	var symlinkMounts []executor.SymlinkMount
+	for _, mount := range directoryMounts {
+		if mount.VMPath != "" {
+			symlinkMounts = append(symlinkMounts, executor.SymlinkMount{
+				MountName: mount.Name,
+				VMPath:    mount.VMPath,
+				CopyMode:  mount.ReadOnly, // Copy read-only mounts to make them writable in VM
+				HostPath:  mount.Path,     // Pass host path for user compatibility symlinks
+			})
+		}
+	}
+	if len(symlinkMounts) > 0 {
+		fmt.Fprintln(os.Stdout, "Setting up custom mount paths...")
+		if err := exec.CreateSymlinks(ctx, symlinkMounts); err != nil {
+			return err
+		}
+		defer func() {
+			_ = exec.CleanupSymlinks(ctx)
+		}()
+	}
+
+	// Configure shared hostname if specified
+	if sharedHostname != "" {
+		fmt.Fprintf(os.Stdout, "Configuring shared hostname '%s'...\n", sharedHostname)
+		hostIP, err := exec.ConfigureSharedHostname(ctx, sharedHostname)
+		if err != nil {
+			return fmt.Errorf("failed to configure shared hostname: %w", err)
+		}
+
+		// Print instructions for host configuration
+		fmt.Fprintln(os.Stdout, strings.Repeat("-", 80))
+		fmt.Fprintf(os.Stdout, "✓ VM configured: %s resolves to %s (host machine)\n", sharedHostname, hostIP)
+		fmt.Fprintf(os.Stdout, "\nTo complete setup, add this to your host's /etc/hosts:\n")
+		fmt.Fprintf(os.Stdout, "  127.0.0.1 %s\n", sharedHostname)
+		fmt.Fprintf(os.Stdout, "\nRun: echo '127.0.0.1 %s' | sudo tee -a /etc/hosts\n", sharedHostname)
+		fmt.Fprintln(os.Stdout, strings.Repeat("-", 80))
+	}
+
+	// Update Claude CLI to latest version (for claude command only)
+	if len(args) > 0 && args[0] == "claude" {
+		fmt.Fprintln(os.Stdout, "Updating Claude CLI to latest version...")
+		if err := exec.UpdateClaude(ctx); err != nil {
+			// Log warning but continue - don't fail if update has issues
+			fmt.Fprintf(os.Stderr, "Warning: %v\n", err)
+		}
+	}
 
 	// Execute command
 	fmt.Fprintf(os.Stdout, "Executing command: %s %v\n", args[0], args[1:])
