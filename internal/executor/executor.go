@@ -3,10 +3,12 @@ package executor
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/cirruslabs/chamber/internal/ssh"
@@ -27,6 +29,7 @@ type Executor struct {
 	mountedWorkDir string
 	dirName        string
 	symlinks       []struct{ from, to string } // Track symlinks for cleanup
+	envVars        map[string]string           // Environment variables to set in VM
 }
 
 func New(sshClient *gossh.Client, workingDir string, dirName string) *Executor {
@@ -35,7 +38,40 @@ func New(sshClient *gossh.Client, workingDir string, dirName string) *Executor {
 		workingDir:     workingDir,
 		mountedWorkDir: fmt.Sprintf("$HOME/workspace/%s", dirName),
 		dirName:        dirName,
+		envVars:        make(map[string]string),
 	}
+}
+
+// SetEnv sets an environment variable to be passed to commands executed in the VM
+func (e *Executor) SetEnv(key, value string) {
+	e.envVars[key] = value
+}
+
+// ForwardCredentials copies Claude credentials from the host to the VM.
+// This allows Claude Max OAuth tokens to work in the VM without mounting ~/.claude read-write.
+func (e *Executor) ForwardCredentials(ctx context.Context, credentialsJSON string) error {
+	if credentialsJSON == "" {
+		return nil
+	}
+
+	session, err := e.sshClient.NewSession()
+	if err != nil {
+		return fmt.Errorf("failed to create SSH session: %w", err)
+	}
+	defer session.Close()
+
+	// Escape the JSON for shell - use base64 to avoid quoting issues
+	encoded := base64.StdEncoding.EncodeToString([]byte(credentialsJSON))
+
+	// Create ~/.claude directory and write credentials file
+	// Uses base64 to safely transfer JSON content through shell
+	command := fmt.Sprintf(`mkdir -p ~/.claude && echo '%s' | base64 -d > ~/.claude/.credentials.json && chmod 600 ~/.claude/.credentials.json`, encoded)
+
+	if err := session.Run(command); err != nil {
+		return fmt.Errorf("failed to write credentials: %w", err)
+	}
+
+	return nil
 }
 
 func (e *Executor) MountWorkingDirectory(ctx context.Context) error {
@@ -197,6 +233,45 @@ func (e *Executor) CleanupSymlinks(ctx context.Context) error {
 	return nil
 }
 
+// DetectPlannotator checks if plannotator is installed in the VM
+// Returns the configured port (from PLANNOTATOR_PORT env) or 19432 as default
+func (e *Executor) DetectPlannotator(ctx context.Context) (bool, int, error) {
+	session, err := e.sshClient.NewSession()
+	if err != nil {
+		return false, 0, fmt.Errorf("failed to create SSH session: %w", err)
+	}
+	defer session.Close()
+
+	// Check if plannotator exists in common locations
+	// Uses login shell to ensure PATH is loaded properly
+	var stdout strings.Builder
+	session.Stdout = &stdout
+
+	// Check for plannotator and get PLANNOTATOR_PORT if set
+	command := `zsh -l -c 'which plannotator >/dev/null 2>&1 && echo "found" && echo "${PLANNOTATOR_PORT:-19432}" || echo "notfound"'`
+	if err := session.Run(command); err != nil {
+		// Command failed - plannotator not found
+		return false, 0, nil
+	}
+
+	output := strings.TrimSpace(stdout.String())
+	lines := strings.Split(output, "\n")
+
+	if len(lines) < 1 || lines[0] != "found" {
+		return false, 0, nil
+	}
+
+	// Parse port
+	port := 19432
+	if len(lines) >= 2 {
+		if p, err := strconv.Atoi(strings.TrimSpace(lines[1])); err == nil && p > 0 {
+			port = p
+		}
+	}
+
+	return true, port, nil
+}
+
 // UpdateClaude updates Claude CLI to the latest version in the VM
 func (e *Executor) UpdateClaude(ctx context.Context) error {
 	session, err := e.sshClient.NewSession()
@@ -334,9 +409,25 @@ func (e *Executor) ExecuteInteractive(ctx context.Context, command string, args 
 	// Create terminal proxy
 	terminal := ssh.NewTerminal(e.sshClient)
 
+	// Build environment variable exports
+	var envExports []string
+	for key, value := range e.envVars {
+		// Escape single quotes in value for shell safety
+		escapedValue := strings.ReplaceAll(value, "'", "'\"'\"'")
+		envExports = append(envExports, fmt.Sprintf("export %s='%s'", key, escapedValue))
+	}
+
 	// Build the full command with working directory change and login shell
 	// Use zsh -l -c to ensure the user's profile is loaded (similar to init.go)
-	innerCommand := fmt.Sprintf("cd %s && %s %s", e.mountedWorkDir, command, strings.Join(args, " "))
+	var innerCommand string
+	if len(envExports) > 0 {
+		// Prepend environment exports before the actual command
+		innerCommand = fmt.Sprintf("%s && cd %s && %s %s",
+			strings.Join(envExports, " && "),
+			e.mountedWorkDir, command, strings.Join(args, " "))
+	} else {
+		innerCommand = fmt.Sprintf("cd %s && %s %s", e.mountedWorkDir, command, strings.Join(args, " "))
+	}
 	fullCommand := fmt.Sprintf("zsh -l -c %q", innerCommand)
 
 	// Execute with full terminal proxying

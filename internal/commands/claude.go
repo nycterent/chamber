@@ -245,6 +245,39 @@ func runCommand(ctx context.Context, vmImage string, cpuCount, memoryMB uint32, 
 	// Create executor
 	exec := executor.New(sshClient, cwd, dirName)
 
+	// Pass through API key environment variables from host
+	// Claude Code uses ANTHROPIC_API_KEY for authentication
+	for _, envKey := range []string{"ANTHROPIC_API_KEY", "CLAUDE_API_KEY"} {
+		if val := os.Getenv(envKey); val != "" {
+			exec.SetEnv(envKey, val)
+		}
+	}
+
+	// Forward Claude credentials (OAuth tokens for Claude Max subscription)
+	if home, err := os.UserHomeDir(); err == nil {
+		credPath := filepath.Join(home, ".claude", ".credentials.json")
+		if credData, err := os.ReadFile(credPath); err == nil {
+			fmt.Fprintln(os.Stdout, "Forwarding Claude credentials...")
+			if err := exec.ForwardCredentials(ctx, string(credData)); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to forward credentials: %v\n", err)
+			}
+		}
+	}
+
+	// Detect plannotator and set up port forwarding if found
+	var portForwarder *ssh.PortForwarder
+	hasPlannotator, plannotatorPort, _ := exec.DetectPlannotator(ctx)
+	if hasPlannotator {
+		portForwarder = ssh.NewPortForwarder(sshClient, plannotatorPort, plannotatorPort)
+		actualPort, err := portForwarder.Start()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to set up plannotator port forwarding: %v\n", err)
+		} else {
+			defer portForwarder.Stop()
+			fmt.Fprintf(os.Stdout, "✓ Plannotator detected: forwarding localhost:%d → VM\n", actualPort)
+		}
+	}
+
 	// Mount working directory
 	fmt.Fprintln(os.Stdout, "Mounting working directory...")
 	if err := exec.MountWorkingDirectory(ctx); err != nil {

@@ -143,6 +143,18 @@ chamber --shared-hostname=dev.local claude
 # Plugins can now reach your host's PostgreSQL at dev.local:5432
 ```
 
+## Plannotator Integration
+
+Chamber supports [Plannotator](https://plannotator.ai) for visually reviewing Claude's plans before execution. When Plannotator is installed in your seed VM, Chamber automatically:
+
+1. Detects Plannotator on startup
+2. Sets up SSH port forwarding
+3. Makes the Plannotator UI accessible at `http://localhost:19432` on your host
+
+This lets you review and annotate Claude's implementation plans in your browser, even though Plannotator runs inside the isolated VM.
+
+**See [docs/plannotator.md](docs/plannotator.md) for setup instructions.**
+
 ## License
 
 This project is licensed under the AGPLv3. Tart is licensed under the Fair Source License which allow royalty free usage on

@@ -26,6 +26,8 @@ go test ./...
 
 # Run a single test
 go test -run TestFunctionName ./path/to/package
+
+# Test files are in: internal/ssh/terminal_test.go, internal/commands/claude_test.go
 ```
 
 ### Testing Chamber Locally
@@ -71,7 +73,7 @@ chamber codex
 - Two execution modes: `Execute()` for non-interactive, `ExecuteInteractive()` for full PTY
 
 **SSH Communication** (`internal/ssh/`):
-- `client.go`: SSH client with retry logic via `WaitForSSH()`
+- `client.go`: SSH client with retry logic via `WaitForSSH()`; includes `PortForwarder` for SSH local port forwarding
 - `terminal.go`: Full PTY terminal proxying with window resize support (`SIGWINCH`)
 - Handles both interactive (raw terminal) and non-interactive modes
 
@@ -170,11 +172,61 @@ The hostname persists for the lifetime of the ephemeral VM but is destroyed on V
 
 **Technical note**: The host IP is discovered by finding the VM's default gateway using `netstat -nr`.
 
-## Testing
+## Automatic Plannotator Port Forwarding
 
-Test files: `internal/ssh/terminal_test.go`, `internal/commands/claude_test.go`
+Chamber automatically detects if [Plannotator](https://plannotator.ai) is installed in the seed VM and sets up SSH port forwarding so you can access the Plannotator UI from your host browser.
 
-Use standard `go test` - no custom test framework.
+> **For detailed setup instructions, see [docs/plannotator.md](docs/plannotator.md)**
+
+### How It Works
+
+1. When starting a VM, Chamber checks if `plannotator` exists in the VM's PATH
+2. If found, it reads `PLANNOTATOR_PORT` (default: 19432) from the VM's environment
+3. Chamber sets up an SSH local port forward: `localhost:PORT` (host) → `localhost:PORT` (VM)
+4. When Claude exits plan mode and Plannotator starts, access it at `http://localhost:19432` on your host
+
+### Setup
+
+**1. Install plannotator in the seed VM:**
+```bash
+tart run chamber-seed
+# Inside VM:
+curl -fsSL https://plannotator.ai/install.sh | bash
+# Stop VM to persist:
+sudo shutdown -h now
+```
+
+**2. Configure Claude hooks in the seed VM:**
+Create `~/.claude/settings.json` in the VM:
+```json
+{
+  "hooks": {
+    "PermissionRequest": [
+      {
+        "matcher": "ExitPlanMode",
+        "hooks": [{"type": "command", "command": "plannotator", "timeout": 1800}]
+      }
+    ]
+  }
+}
+```
+
+**3. Set remote mode environment variables** (add to `~/.zshrc` in VM):
+```bash
+export PLANNOTATOR_REMOTE=1
+export PLANNOTATOR_PORT=19432
+```
+
+### Usage
+
+When you run `chamber claude` and see:
+```
+✓ Plannotator detected: forwarding localhost:19432 → VM
+```
+
+Then Plannotator URLs will work directly at `http://localhost:19432/...` on your host - no need to manually set up SSH tunnels or replace the VM IP.
+
+**Important**: Plannotator only starts when Claude exits plan mode - it's triggered by the hook and receives event data via stdin. You cannot run `plannotator` manually to test it. The browser will show "connection reset" until Claude actually triggers ExitPlanMode.
 
 ## Troubleshooting
 
