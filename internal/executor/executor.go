@@ -127,8 +127,9 @@ func (e *Executor) CreateSymlinks(ctx context.Context, mounts []SymlinkMount) er
 	}
 	defer session.Close()
 
-	// Capture stderr for debugging
-	var stderr strings.Builder
+	// Capture stdout and stderr for debugging
+	var stdout, stderr strings.Builder
+	session.Stdout = &stdout
 	session.Stderr = &stderr
 
 	var commands []string
@@ -203,6 +204,11 @@ func (e *Executor) CreateSymlinks(ctx context.Context, mounts []SymlinkMount) er
 			return fmt.Errorf("failed to create symlinks: %w (stderr: %s)", err, errMsg)
 		}
 		return fmt.Errorf("failed to create symlinks: %w", err)
+	}
+
+	// Print debug output if any
+	if out := stdout.String(); out != "" {
+		fmt.Fprintln(os.Stdout, out)
 	}
 
 	return nil

@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"os"
+	osexec "os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 
@@ -254,15 +256,36 @@ func runCommand(ctx context.Context, vmImage string, cpuCount, memoryMB uint32, 
 	}
 
 	// Forward Claude credentials (OAuth tokens for Claude Max subscription)
-	if home, err := os.UserHomeDir(); err == nil {
-		credPath := filepath.Join(home, ".claude", ".credentials.json")
-		if credData, err := os.ReadFile(credPath); err == nil {
-			fmt.Fprintln(os.Stdout, "Forwarding Claude credentials...")
-			if err := exec.ForwardCredentials(ctx, string(credData)); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: failed to forward credentials: %v\n", err)
+	// On macOS, credentials are stored in the Keychain; on Linux, in ~/.claude/.credentials.json
+	var credentialsJSON string
+	var credSource string
+
+	if runtime.GOOS == "darwin" {
+		// Try to extract credentials from macOS Keychain
+		cmd := osexec.Command("security", "find-generic-password",
+			"-s", "Claude Code-credentials",
+			"-w")
+		output, err := cmd.Output()
+		if err == nil {
+			credentialsJSON = strings.TrimSpace(string(output))
+			credSource = "macOS Keychain"
+		}
+		// Don't log keychain failures - fall back silently to file
+	}
+
+	// Fall back to file-based credentials (Linux or if Keychain fails)
+	if credentialsJSON == "" {
+		if home, err := os.UserHomeDir(); err == nil {
+			credPath := filepath.Join(home, ".claude", ".credentials.json")
+			if credData, err := os.ReadFile(credPath); err == nil {
+				credentialsJSON = string(credData)
+				credSource = credPath
 			}
 		}
 	}
+
+	// Note: Actual credential forwarding happens after CreateSymlinks to avoid
+	// being overwritten by --dir=~/.claude:~/.claude:ro copy operation
 
 	// Detect plannotator and set up port forwarding if found
 	var portForwarder *ssh.PortForwarder
@@ -307,6 +330,17 @@ func runCommand(ctx context.Context, vmImage string, cpuCount, memoryMB uint32, 
 		defer func() {
 			_ = exec.CleanupSymlinks(ctx)
 		}()
+	}
+
+	// Forward Claude credentials AFTER symlink setup to avoid being overwritten
+	// by --dir=~/.claude:~/.claude:ro copy operation
+	if credentialsJSON != "" {
+		fmt.Fprintf(os.Stdout, "Forwarding Claude credentials from %s...\n", credSource)
+		if err := exec.ForwardCredentials(ctx, credentialsJSON); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to forward credentials: %v\n", err)
+		}
+	} else {
+		fmt.Fprintln(os.Stderr, "Note: No Claude credentials found (use ANTHROPIC_API_KEY or login to Claude Code)")
 	}
 
 	// Configure shared hostname if specified
